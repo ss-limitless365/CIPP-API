@@ -24,9 +24,9 @@ Function Invoke-RemoveQueuedAlert {
 
     $Table = Get-CIPPTable -TableName $Table
     try {
-        $Filter = "RowKey eq '{0}'" -f $ID
+        $Filter = "RowKey eq '{0}'" -f (ConvertTo-CIPPODataFilterValue -Value $ID)
         $Alert = Get-CIPPAzDataTableEntity @Table -Filter $Filter -Property PartitionKey, RowKey
-        Remove-AzDataTableEntity -Force @Table -Entity $Alert
+        Remove-CIPPAzDataTableEntity -Force @Table -Entity $Alert
         $Result = "Successfully removed alert $ID from queue"
         Write-LogMessage -headers $Headers -API $APIName -message $Result -Sev 'Info'
         $StatusCode = [HttpStatusCode]::OK

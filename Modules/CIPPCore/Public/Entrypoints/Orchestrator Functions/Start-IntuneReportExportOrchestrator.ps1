@@ -1,7 +1,7 @@
 function Start-IntuneReportExportOrchestrator {
     <#
     .SYNOPSIS
-        Submits Intune report-export jobs at 02:00 UTC ahead of the 03:00 cache run.
+        Submits Intune report-export jobs an hour ahead of the nightly cache run.
     .FUNCTIONALITY
         Entrypoint
     #>
@@ -11,7 +11,7 @@ function Start-IntuneReportExportOrchestrator {
     try {
         Write-LogMessage -API 'IntuneReportExport' -message 'Starting Intune report export submission' -sev Info
 
-        $TenantList = Get-Tenants | Where-Object { $_.defaultDomainName -ne $null }
+        $TenantList = Get-Tenants | Where-Object { $null -ne $_.defaultDomainName }
         if ($TenantList.Count -eq 0) {
             return
         }
@@ -50,6 +50,7 @@ function Start-IntuneReportExportOrchestrator {
         Start-CIPPOrchestrator -InputObject ([PSCustomObject]@{
             Batch            = @($Batch)
             OrchestratorName = 'IntuneReportExportOrchestrator'
+            Priority         = 3
             SkipLog          = $false
         })
 

@@ -11,23 +11,28 @@ function Invoke-ExecCreateAppTemplate {
     param($Request, $TriggerMetadata)
 
     $APIName = $TriggerMetadata.FunctionName
-    Write-LogMessage -headers $Request.headers -API $APINAME -message 'Accessed this API' -Sev 'Debug'
+
+    $TenantFilter = $Request.Body.TenantFilter
+    $AppId = $Request.Body.AppId
+    $DisplayName = $Request.Body.DisplayName
+    $Type = $Request.Body.Type # 'servicePrincipal' or 'application'
+    $Overwrite = $Request.Body.Overwrite -eq $true
+
+    if ([string]::IsNullOrWhiteSpace($AppId)) {
+        return ([HttpResponseContext]@{
+                StatusCode = [HttpStatusCode]::BadRequest
+                Body       = (@{ Results = @(@{ resultText = 'Failed to create template: AppId is required'; state = 'error' }) } | ConvertTo-Json -Depth 10)
+            })
+    }
+
+    if ([string]::IsNullOrWhiteSpace($DisplayName)) {
+        return ([HttpResponseContext]@{
+                StatusCode = [HttpStatusCode]::BadRequest
+                Body       = (@{ Results = @(@{ resultText = 'Failed to create template: DisplayName is required'; state = 'error' }) } | ConvertTo-Json -Depth 10)
+            })
+    }
 
     try {
-        $TenantFilter = $Request.Body.TenantFilter
-        $AppId = $Request.Body.AppId
-        $DisplayName = $Request.Body.DisplayName
-        $Type = $Request.Body.Type # 'servicePrincipal' or 'application'
-        $Overwrite = $Request.Body.Overwrite -eq $true
-
-        if ([string]::IsNullOrWhiteSpace($AppId)) {
-            throw 'AppId is required'
-        }
-
-        if ([string]::IsNullOrWhiteSpace($DisplayName)) {
-            throw 'DisplayName is required'
-        }
-
         # Build initial bulk request to get app registration and all service principals
         # The SP we need will be in the splist, so we don't need a separate call
         $InitialBulkRequests = @(
@@ -63,12 +68,14 @@ function Invoke-ExecCreateAppTemplate {
             $SignInAudience = $SPResult.signInAudience
         }
         if (-not [string]::IsNullOrWhiteSpace($SignInAudience) -and $SignInAudience -notin $MultiTenantAudiences) {
+            $StatusCode = [HttpStatusCode]::BadRequest
             throw "Application '$DisplayName' is single-tenant (signInAudience '$SignInAudience') and cannot be used as an Enterprise App template. Create a Manifest (single-tenant) template for this app instead."
         }
 
         # Get the app details based on type
         if ($Type -eq 'servicePrincipal') {
             if (-not $SPResult) {
+                $StatusCode = [HttpStatusCode]::NotFound
                 throw "Service principal not found for AppId: $AppId"
             }
 
@@ -145,6 +152,7 @@ function Invoke-ExecCreateAppTemplate {
         } else {
             # For app registrations (applications)
             if ($AppResult.status -ne 200 -or -not $AppResult.body) {
+                $StatusCode = [HttpStatusCode]::NotFound
                 throw "App registration not found for AppId: $AppId"
             }
 
@@ -158,7 +166,7 @@ function Invoke-ExecCreateAppTemplate {
                     Write-Information "App Registration $AppId already exists in partner tenant"
                     $AppId = $ExistingApp.appId
                     $App = $ExistingApp
-                    Write-LogMessage -headers $Request.headers -API $APINAME -message "App Registration $($AppDetails.displayName) already exists in partner tenant" -Sev 'Info'
+                    Write-LogMessage -headers $Request.headers -API $APINAME -message "App Registration $($DisplayName) already exists in partner tenant" -Sev 'Info'
                 } else {
                     Write-Information "Copying App Registration $AppId from customer tenant $TenantFilter to partner tenant"
                     $PropertiesToRemove = @(
@@ -222,7 +230,7 @@ function Invoke-ExecCreateAppTemplate {
                         appId = $AppId
                     }
                     $null = New-GraphPOSTRequest -uri 'https://graph.microsoft.com/v1.0/servicePrincipals' -tenantid $env:TenantID -NoAuthCheck $true -AsApp $true -type POST -body ($Body | ConvertTo-Json -Depth 10)
-                    Write-LogMessage -headers $Request.headers -API $APINAME -message "App Registration $($AppDetails.displayName) copied to partner tenant" -Sev 'Info'
+                    Write-LogMessage -headers $Request.headers -API $APINAME -message "App Registration $($DisplayName) copied to partner tenant" -Sev 'Info'
                 }
             }
 
@@ -235,6 +243,17 @@ function Invoke-ExecCreateAppTemplate {
         $CIPPPermissions = @{}
         $PermissionSetId = $null
         $PermissionSetName = "$DisplayName (Auto-created)"
+
+        # The service principal fallback above emits a separate entry for delegated access
+        # (oauth2PermissionGrants) and application access (appRoleAssignments), so a resource that has
+        # both appears twice. $CIPPPermissions is keyed by resourceAppId, so without merging here the
+        # second entry overwrites the first and one of the two permission types is silently discarded.
+        $Permissions = @($Permissions | Group-Object -Property resourceAppId | ForEach-Object {
+                [PSCustomObject]@{
+                    resourceAppId  = $_.Name
+                    resourceAccess = @($_.Group.resourceAccess)
+                }
+            })
 
         if ($Permissions -and $Permissions.Count -gt 0) {
             # Build bulk requests to get all service principals efficiently using object IDs from cached list
@@ -334,9 +353,11 @@ function Invoke-ExecCreateAppTemplate {
                     }
                 }
 
+                # A resource can carry several oauth2PermissionGrants rows (an AllPrincipals grant plus
+                # per-user grants), which repeats the same scope once merged, so dedupe on the claim value.
                 $CIPPPermissions[$ResourceAppId] = [PSCustomObject]@{
-                    applicationPermissions = @($AppPerms)
-                    delegatedPermissions   = @($DelegatedPerms)
+                    applicationPermissions = @($AppPerms | Sort-Object -Property value -Unique)
+                    delegatedPermissions   = @($DelegatedPerms | Sort-Object -Property value -Unique)
                 }
             }
 
@@ -480,7 +501,7 @@ function Invoke-ExecCreateAppTemplate {
                     details    = Get-CippException -Exception $_
                 })
         }
-        $StatusCode = [HttpStatusCode]::BadRequest
+        $StatusCode = $StatusCode ?? [HttpStatusCode]::InternalServerError
     }
 
     return ([HttpResponseContext]@{

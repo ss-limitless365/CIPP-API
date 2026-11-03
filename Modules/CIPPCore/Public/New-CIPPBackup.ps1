@@ -54,9 +54,13 @@ function New-CIPPBackup {
                         'Extensions'
                         'WebhookRules'
                         'ScheduledTasks'
+                        'DeltaQueries'
                         'TenantProperties'
                         'TenantGroups'
                         'TenantGroupMembers'
+                        'BaselineRollouts'
+                        'Baselines'
+                        'BaselineRolloutState'
                     )
                     $CSVfile = foreach ($CSVTable in $BackupTables) {
                         $Table = Get-CippTable -tablename $CSVTable
@@ -125,7 +129,7 @@ function New-CIPPBackup {
         try {
             $containers = @()
             try { $containers = New-CIPPAzStorageRequest -Service 'blob' -Component 'list' -ConnectionString $ConnectionString } catch { $containers = @() }
-            $exists = ($containers | Where-Object { $_.Name -eq $ContainerName }) -ne $null
+            $exists = $null -ne ($containers | Where-Object { $_.Name -eq $ContainerName })
             if (-not $exists) {
                 $null = New-CIPPAzStorageRequest -Service 'blob' -Resource $ContainerName -Method 'PUT' -QueryParams @{ restype = 'container' } -ConnectionString $ConnectionString
                 Start-Sleep -Milliseconds 500

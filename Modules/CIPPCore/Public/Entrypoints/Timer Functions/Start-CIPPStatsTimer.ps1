@@ -34,8 +34,12 @@ function Start-CIPPStatsTimer {
         [bool]::TryParse($FunctionOffloading, [ref]$OffloadingEnabled) | Out-Null
         $CIPPNG = $env:CIPPNG -eq 'true'
 
-        # Get counts of various entities across all tenants
-        $counts = Get-CIPPDbItem -TenantFilter AllTenants -CountsOnly
+        # Get counts of various entities across all tenants: one key read per tenant per type, since a count read without a type scans the whole table
+        $IntunePolicyTypes = @(@(Get-CIPPIntunePolicyListDefinitions).CacheType) + @('IntunePolicyGroups', 'IntuneAppProtectionPolicyGroups', 'IntuneAppProtectionManagedAppPolicies', 'IntuneCompliancePolicyGroups') |
+            Where-Object { $_ -match 'Intune' -and $_ -match 'Policies|Policy' } | Sort-Object -Unique
+        $counts = foreach ($Type in @('Users', 'Devices', 'Groups', 'ManagedDevices', 'IntuneApplications') + $IntunePolicyTypes) {
+            Get-CIPPDbItem -TenantFilter AllTenants -CountsOnly -Type $Type
+        }
         $userCount = ($counts | Where-Object { $_.RowKey -eq 'Users-Count' } | Measure-Object -Property DataCount -Sum).Sum
         $deviceCount = ($counts | Where-Object { $_.RowKey -eq 'Devices-Count' } | Measure-Object -Property DataCount -Sum).Sum
         $groupsCount = ($counts | Where-Object { $_.RowKey -eq 'Groups-Count' } | Measure-Object -Property DataCount -Sum).Sum
@@ -47,6 +51,7 @@ function Start-CIPPStatsTimer {
         $uniqueStandardsApplied = Get-CIPPStatsUniqueStandardsApplied
         $driftStandardsCount = Get-CIPPStatsDriftStandardsCount
         $mobileEnrollment = Get-CIPPStatsMobileEnrollment
+        $baselineStats = Get-CIPPStatsBaselines
 
         # Feature flags
         $FeatureFlags = @{}
@@ -58,6 +63,20 @@ function Start-CIPPStatsTimer {
         $MigrationTable = Get-CIPPTable -tablename 'SSOMigration'
         $MigrationConfig = Get-CIPPAzDataTableEntity @MigrationTable -Filter "PartitionKey eq 'SSO' and RowKey eq 'MigrationConfig'" -ErrorAction SilentlyContinue
         $MigrationStatus = $MigrationConfig.Status
+        # SSO provisioned outside the setup wizard (ARM-level during NG migration) never writes a
+        # migration row. Live EasyAuth is authoritative: when it's active and the row is missing or
+        # points at a different app, report complete — same rule as Invoke-ExecSSOSetup's Status action.
+        if ($CIPPNG -and $env:WEBSITE_AUTH_ENABLED -eq 'True' -and $env:WEBSITE_AUTH_V2_CONFIG_JSON) {
+            try {
+                $LiveConfig = $env:WEBSITE_AUTH_V2_CONFIG_JSON | ConvertFrom-Json -ErrorAction Stop
+                $LiveAppId = $LiveConfig.identityProviders.azureActiveDirectory.registration.clientId
+                if ($LiveAppId -and $MigrationConfig.AppId -ne $LiveAppId) {
+                    $MigrationStatus = 'complete'
+                }
+            } catch {
+                Write-Information "Could not parse EasyAuth config for SSO stats: $($_.Exception.Message)"
+            }
+        }
 
         $SendingObject = [PSCustomObject]@{
             rgid                   = $env:WEBSITE_SITE_NAME
@@ -84,14 +103,18 @@ function Start-CIPPStatsTimer {
             Gradient               = $RawExt.Gradient.Enabled
             NinjaOne               = $RawExt.NinjaOne.Enabled
             haloPSA                = $RawExt.haloPSA.Enabled
+            Syncro                 = $RawExt.Syncro.Enabled
             HIBP                   = $RawExt.HIBP.Enabled
             PWPush                 = $RawExt.PWPush.Enabled
             CFZTNA                 = $RawExt.CFZTNA.Enabled
             GitHub                 = $RawExt.GitHub.Enabled
-            BestPracticeAnalyser   = $FeatureFlags.BestPracticeAnalyser
             SuperAdminNG           = $FeatureFlags.SuperAdminNG
             MCPServer              = $FeatureFlags.MCPServer
             SSOMigrationStatus     = $MigrationStatus
+            FeatureFlags           = ($FeatureFlags | ConvertTo-Json -Compress)
+            BaselineCount          = $baselineStats.BaselineCount
+            BaselineTenantCount    = $baselineStats.BaselineTenantCount
+            BaselineStandardsCount = $baselineStats.BaselineStandardsCount
         } | ConvertTo-Json
 
         try {

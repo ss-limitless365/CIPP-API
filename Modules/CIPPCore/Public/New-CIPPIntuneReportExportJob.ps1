@@ -49,14 +49,23 @@ function New-CIPPIntuneReportExportJob {
         select           = $Select
     } | ConvertTo-Json -Depth 5
 
-    $Job = New-GraphPOSTRequest -uri 'https://graph.microsoft.com/beta/deviceManagement/reports/exportJobs' -tenantid $TenantFilter -body $Body
+    # Intune intermittently answers 500 for some tenants
+    foreach ($Attempt in 1..3) {
+        try {
+            $Job = New-GraphPOSTRequest -uri 'https://graph.microsoft.com/beta/deviceManagement/reports/exportJobs' -tenantid $TenantFilter -body $Body
+            break
+        } catch {
+            if ($Attempt -eq 3) { throw }
+            Start-Sleep -Seconds 5
+        }
+    }
 
     if (-not $Job.id) { throw "Intune returned no job id for $ReportName" }
 
     $JobsTable = Get-CIPPTable -tablename 'IntuneReportJobs'
     $Existing = Get-CIPPAzDataTableEntity @JobsTable -Filter "PartitionKey eq '$TenantFilter' and RowKey eq '$ReportName'"
     if ($Existing) {
-        Remove-AzDataTableEntity @JobsTable -Entity $Existing -Force -ErrorAction SilentlyContinue
+        Remove-CIPPAzDataTableEntity @JobsTable -Entity $Existing -Force -ErrorAction SilentlyContinue
     }
 
     Add-CIPPAzDataTableEntity @JobsTable -Entity @{

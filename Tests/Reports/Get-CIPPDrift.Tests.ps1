@@ -25,7 +25,7 @@ BeforeAll {
     function Get-CIPPTenantAlignment { param($TenantFilter, $TemplateId) }
     function New-GraphBulkRequest { param($Requests, $tenantid, $asapp) }
     function Add-CIPPAzDataTableEntity { param($Entity, [switch]$Force, $TableName) }
-    function Remove-AzDataTableEntity { param($Entity, $TableName) }
+    function Remove-CIPPAzDataTableEntity { param($Entity, $TableName) }
 
     # Builds an IntuneTemplate row the way the templates table stores it: JSON is a wrapper object
     # (Displayname/Description/Type/RAWJson) where RAWJson is itself a JSON string of the captured
@@ -106,7 +106,10 @@ BeforeAll {
         }
     }
 
+    function Get-CIPPTenantLookup { @{} }
+
     . $FunctionPath
+    . (Join-Path $RepoRoot 'Modules/CIPPCore/Public/Get-CIPPTenantDriftState.ps1')
 }
 
 Describe 'Get-CIPPDrift - Intune extra-policy matching (#6347 and Settings Catalog regression)' {
@@ -148,7 +151,7 @@ Describe 'Get-CIPPDrift - Intune extra-policy matching (#6347 and Settings Catal
             param($Entity, [switch]$Force, $TableName)
             foreach ($e in @($Entity)) { $script:AddedDriftEntities.Add($e) }
         }
-        Mock -CommandName Remove-AzDataTableEntity -MockWith {
+        Mock -CommandName Remove-CIPPAzDataTableEntity -MockWith {
             param($Entity, $TableName)
             $script:RemovedDriftEntities.Add($Entity)
         }
@@ -329,7 +332,7 @@ Describe 'Get-CIPPDrift - Conditional Access extra-policy matching' {
             }
         }
         Mock -CommandName Add-CIPPAzDataTableEntity -MockWith { param($Entity, [switch]$Force, $TableName) }
-        Mock -CommandName Remove-AzDataTableEntity -MockWith { param($Entity, $TableName) }
+        Mock -CommandName Remove-CIPPAzDataTableEntity -MockWith { param($Entity, $TableName) }
     }
 
     It 'does not report a deviation when displayName matches exactly' {
@@ -378,7 +381,7 @@ Describe 'Get-CIPPDrift - standards deviation display name resolution' {
         }
         Mock -CommandName New-GraphBulkRequest -MockWith { @() }
         Mock -CommandName Add-CIPPAzDataTableEntity -MockWith { param($Entity, [switch]$Force, $TableName) }
-        Mock -CommandName Remove-AzDataTableEntity -MockWith { param($Entity, $TableName) }
+        Mock -CommandName Remove-CIPPAzDataTableEntity -MockWith { param($Entity, $TableName) }
     }
 
     It 'resolves the Intune template display name and description for standards.IntuneTemplate deviations' {
@@ -469,14 +472,28 @@ Describe 'Get-CIPPDrift - stale drift entity pruning' {
         $script:IntuneTemplateRows = @()
         $script:CATemplateRows = @()
         $script:ReusableTemplateRows = @()
+        $script:DriftEntityRows = @()
         $script:GraphResponses = @{}
+        $script:AddedDriftEntities = [System.Collections.Generic.List[object]]::new()
         $script:RemovedDriftEntities = [System.Collections.Generic.List[object]]::new()
 
         Mock -CommandName Test-CIPPStandardLicense -MockWith { $false }
         Mock -CommandName Get-CippTable -MockWith { param($tablename) @{ TableName = $tablename } }
         Mock -CommandName New-GraphBulkRequest -MockWith { @() }
-        Mock -CommandName Add-CIPPAzDataTableEntity -MockWith { param($Entity, [switch]$Force, $TableName) }
-        Mock -CommandName Remove-AzDataTableEntity -MockWith {
+        Mock -CommandName Get-CIPPAzDataTableEntity -MockWith {
+            param($Filter, $TableName)
+            switch -Wildcard ($Filter) {
+                "*PartitionKey eq 'IntuneTemplate'*" { return @($script:IntuneTemplateRows) }
+                "*PartitionKey eq 'CATemplate'*" { return @($script:CATemplateRows) }
+                "*PartitionKey eq 'IntuneReusableSettingTemplate'*" { return @($script:ReusableTemplateRows) }
+                default { return @($script:DriftEntityRows) }
+            }
+        }
+        Mock -CommandName Add-CIPPAzDataTableEntity -MockWith {
+            param($Entity, [switch]$Force, $TableName)
+            foreach ($e in @($Entity)) { $script:AddedDriftEntities.Add($e) }
+        }
+        Mock -CommandName Remove-CIPPAzDataTableEntity -MockWith {
             param($Entity, $TableName)
             $script:RemovedDriftEntities.Add($Entity)
         }
@@ -494,16 +511,9 @@ Describe 'Get-CIPPDrift - stale drift entity pruning' {
     }
 
     It 'removes a stale plain standards drift row that no longer appears in the alignment' {
-        $script:DriftEntityRows = @(New-DriftEntity -StandardName 'standards.LongGoneStandard')
-        Mock -CommandName Get-CIPPAzDataTableEntity -MockWith {
-            param($Filter, $TableName)
-            switch -Wildcard ($Filter) {
-                "*PartitionKey eq 'IntuneTemplate'*" { return @() }
-                "*PartitionKey eq 'CATemplate'*" { return @() }
-                "*PartitionKey eq 'IntuneReusableSettingTemplate'*" { return @() }
-                default { return @($script:DriftEntityRows) }
-            }
-        }
+        # Undecided ('New') rows are the only standards-type rows eligible for pruning - decided
+        # rows are protected (see the decided-row tests below), so the explicit Status matters here.
+        $script:DriftEntityRows = @(New-DriftEntity -StandardName 'standards.LongGoneStandard' -Status 'New')
 
         Get-CIPPDrift -TenantFilter 'contoso.onmicrosoft.com' | Out-Null
 
@@ -516,32 +526,55 @@ Describe 'Get-CIPPDrift - stale drift entity pruning' {
         # $true; a stale IntuneTemplates.* row must be protected from deletion in that case, since we
         # cannot prove the tenant policy is actually gone without a successful Graph collection.
         $script:DriftEntityRows = @(New-DriftEntity -StandardName 'IntuneTemplates.some-tenant-policy-id')
-        Mock -CommandName Get-CIPPAzDataTableEntity -MockWith {
-            param($Filter, $TableName)
-            switch -Wildcard ($Filter) {
-                "*PartitionKey eq 'IntuneTemplate'*" { return @() }
-                "*PartitionKey eq 'CATemplate'*" { return @() }
-                "*PartitionKey eq 'IntuneReusableSettingTemplate'*" { return @() }
-                default { return @($script:DriftEntityRows) }
-            }
-        }
 
         Get-CIPPDrift -TenantFilter 'contoso.onmicrosoft.com' | Out-Null
 
         $script:RemovedDriftEntities.Count | Should -Be 0
     }
 
-    It 'does not remove a drift row that is still referenced by the current alignment' {
-        $script:DriftEntityRows = @(New-DriftEntity -StandardName 'standards.StillRelevant')
-        Mock -CommandName Get-CIPPAzDataTableEntity -MockWith {
-            param($Filter, $TableName)
-            switch -Wildcard ($Filter) {
-                "*PartitionKey eq 'IntuneTemplate'*" { return @() }
-                "*PartitionKey eq 'CATemplate'*" { return @() }
-                "*PartitionKey eq 'IntuneReusableSettingTemplate'*" { return @() }
-                default { return @($script:DriftEntityRows) }
+    It 'does not remove a decided IntuneTemplates row when a continuation page of the policy inventory failed' {
+        # New-GraphBulkRequest keeps status 200 on an item whose later page failed and flags it
+        # PagingIncomplete instead. Policies on the missing page are absent from the inventory, so
+        # without this gate their accepted rows were pruned as "gone" and re-created as New on the
+        # next run (the reported reset of customer-specific deviations every couple of days).
+        $script:DriftEntityRows = @(New-DriftEntity -StandardName 'IntuneTemplates.policy-on-page-two' -Status 'CustomerSpecific' -Reason 'customer specific' -User 'admin@msp.com')
+        Mock -CommandName Test-CIPPStandardLicense -MockWith { param($StandardName, $TenantFilter, $Preset) $Preset -eq 'Intune' }
+        Mock -CommandName New-GraphBulkRequest -MockWith {
+            param($Requests, $tenantid, $asapp)
+            foreach ($r in $Requests) {
+                $Item = [pscustomobject]@{ id = $r.id; status = 200; body = @{ value = @() } }
+                if ($r.id -eq 'deviceManagement/configurationPolicies') {
+                    $Item | Add-Member -NotePropertyName 'PagingIncomplete' -NotePropertyValue $true
+                    $Item | Add-Member -NotePropertyName 'PagingError' -NotePropertyValue 'continuation page returned 429'
+                }
+                $Item
             }
         }
+
+        Get-CIPPDrift -TenantFilter 'contoso.onmicrosoft.com' -WarningVariable Warnings -WarningAction SilentlyContinue | Out-Null
+
+        $script:RemovedDriftEntities.Count | Should -Be 0
+        @($Warnings) | Where-Object { $_ -match 'incomplete' -and $_ -match '429' } | Should -Not -BeNullOrEmpty
+    }
+
+    It 'still prunes a vanished IntuneTemplates row when every page of the inventory succeeded' {
+        # Control for the test above: same rows, same inventory, no incomplete flag - the row has no
+        # matching tenant policy and is correctly removed.
+        $script:DriftEntityRows = @(New-DriftEntity -StandardName 'IntuneTemplates.policy-really-gone' -Status 'CustomerSpecific' -Reason 'customer specific' -User 'admin@msp.com')
+        Mock -CommandName Test-CIPPStandardLicense -MockWith { param($StandardName, $TenantFilter, $Preset) $Preset -eq 'Intune' }
+        Mock -CommandName New-GraphBulkRequest -MockWith {
+            param($Requests, $tenantid, $asapp)
+            foreach ($r in $Requests) { [pscustomobject]@{ id = $r.id; status = 200; body = @{ value = @() } } }
+        }
+
+        Get-CIPPDrift -TenantFilter 'contoso.onmicrosoft.com' | Out-Null
+
+        $script:RemovedDriftEntities.Count | Should -Be 1
+        $script:RemovedDriftEntities[0].StandardName | Should -Be 'IntuneTemplates.policy-really-gone'
+    }
+
+    It 'does not remove a drift row that is still referenced by the current alignment' {
+        $script:DriftEntityRows = @(New-DriftEntity -StandardName 'standards.StillRelevant')
         Mock -CommandName Get-CIPPTenantAlignment -MockWith {
             @([pscustomobject]@{
                     standardType         = 'drift'
@@ -564,5 +597,248 @@ Describe 'Get-CIPPDrift - stale drift entity pruning' {
         Get-CIPPDrift -TenantFilter 'contoso.onmicrosoft.com' | Out-Null
 
         $script:RemovedDriftEntities.Count | Should -Be 0
+    }
+
+    It 'keeps a decided (<Status>) standards row when its key disappears from the alignment' -TestCases @(
+        @{ Status = 'Accepted' }
+        @{ Status = 'Denied' }
+        @{ Status = 'DeniedRemediate' }
+        @{ Status = 'DeniedDelete' }
+        @{ Status = 'CustomerSpecific' }
+    ) {
+        # Standards-type keys can transiently drop out of ComparisonDetails (package/tag membership
+        # changes, template re-saves). A decided row is invisible to the alignment score once its key
+        # is gone, so retaining it is harmless - deleting it destroys the user's decision and makes
+        # the deviation reappear as 'New' on the next run (the reported bug).
+        $script:DriftEntityRows = @(New-DriftEntity -StandardName 'standards.IntuneTemplate.pkg-row-1' -Status $Status -Reason 'kept' -User 'admin@msp.com')
+
+        Get-CIPPDrift -TenantFilter 'contoso.onmicrosoft.com' | Out-Null
+
+        $script:RemovedDriftEntities.Count | Should -Be 0
+        $script:AddedDriftEntities.Count | Should -Be 0
+    }
+
+    It 'prunes an undecided stale standards row even when Status is null' {
+        # Statusless rows can only be ancient or hand-made (both writers always set Status); they
+        # carry no user decision, so they are treated as undecided and remain prunable.
+        $script:DriftEntityRows = @(New-DriftEntity -StandardName 'standards.NoStatus' -Status $null)
+
+        Get-CIPPDrift -TenantFilter 'contoso.onmicrosoft.com' | Out-Null
+
+        $script:RemovedDriftEntities.Count | Should -Be 1
+        $script:RemovedDriftEntities[0].StandardName | Should -Be 'standards.NoStatus'
+    }
+
+    It 'resumes the prior status when a dropped key returns' {
+        $script:DriftEntityRows = @(New-DriftEntity -StandardName 'standards.TransientKey' -Status 'Accepted' -Reason 'known deviation' -User 'admin@msp.com')
+
+        # Run 1: key absent from the alignment - the decided row must survive.
+        Get-CIPPDrift -TenantFilter 'contoso.onmicrosoft.com' | Out-Null
+        $script:RemovedDriftEntities.Count | Should -Be 0
+
+        # Run 2: key returns as non-compliant - the deviation must resume as Accepted, not New.
+        # The table mock reads $script:DriftEntityRows at invocation time, so the surviving row is
+        # still present, mimicking table persistence across runs.
+        Mock -CommandName Get-CIPPTenantAlignment -MockWith {
+            @([pscustomobject]@{
+                    standardType         = 'drift'
+                    StandardName         = 'Standard'
+                    StandardId           = 'sid-8'
+                    AlignmentScore       = 90
+                    CompliantStandards   = 0
+                    LatestDataCollection = (Get-Date)
+                    ComparisonDetails    = @(
+                        [pscustomobject]@{
+                            StandardName     = 'standards.TransientKey'
+                            Compliant        = $false
+                            StandardValue    = $false
+                            ComplianceStatus = 'Non-Compliant'
+                        }
+                    )
+                })
+        }
+        $Result = Get-CIPPDrift -TenantFilter 'contoso.onmicrosoft.com'
+
+        $Result.acceptedDeviationsCount | Should -Be 1
+        $Result.newDeviationsCount | Should -Be 0
+        $Result.acceptedDeviations[0].Status | Should -Be 'Accepted'
+        $script:AddedDriftEntities.Count | Should -Be 0
+    }
+
+    It 'does not prune IntuneTemplates rows when any Intune batch item failed' {
+        # Graph $batch returns HTTP 200 even when individual sub-requests fail (e.g. 429 throttling
+        # on one deviceManagement endpoint), so a partial collection must not count as evidence that
+        # the missing policies are gone - otherwise decided extra-policy rows get wiped and reappear
+        # as 'New' after the next healthy run (the reported bug for policies deployed outside the
+        # drift template).
+        Mock -CommandName Test-CIPPStandardLicense -MockWith { param($StandardName, $TenantFilter, $Preset) $Preset -eq 'Intune' }
+        Mock -CommandName New-GraphBulkRequest -MockWith {
+            param($Requests, $tenantid, $asapp)
+            @(
+                [pscustomobject]@{ id = 'deviceAppManagement/managedAppPolicies'; status = 200; body = @{ value = @() } }
+                [pscustomobject]@{ id = 'deviceManagement/configurationPolicies'; status = 429; body = @{ error = @{ message = 'Too many requests' } } }
+            )
+        }
+        $script:DriftEntityRows = @(
+            New-DriftEntity -StandardName 'IntuneTemplates.gone-policy-new' -Status 'New'
+            New-DriftEntity -StandardName 'IntuneTemplates.gone-policy-accepted' -Status 'Accepted'
+        )
+
+        Get-CIPPDrift -TenantFilter 'contoso.onmicrosoft.com' | Out-Null
+
+        $script:RemovedDriftEntities.Count | Should -Be 0
+    }
+
+    It 'removes stale New and Accepted IntuneTemplates rows when every Intune batch item succeeded' {
+        # Policy rows count against the alignment score by existence, so a fully successful
+        # collection that lacks the policy must prune the row regardless of Status - this is also
+        # what clears a DeniedDelete row after its tenant policy is deleted.
+        Mock -CommandName Test-CIPPStandardLicense -MockWith { param($StandardName, $TenantFilter, $Preset) $Preset -eq 'Intune' }
+        Mock -CommandName New-GraphBulkRequest -MockWith {
+            param($Requests, $tenantid, $asapp)
+            foreach ($r in $Requests) {
+                [pscustomobject]@{ id = $r.id; status = 200; body = @{ value = @() } }
+            }
+        }
+        $script:DriftEntityRows = @(
+            New-DriftEntity -StandardName 'IntuneTemplates.gone-policy-new' -Status 'New'
+            New-DriftEntity -StandardName 'IntuneTemplates.gone-policy-accepted' -Status 'Accepted'
+        )
+
+        Get-CIPPDrift -TenantFilter 'contoso.onmicrosoft.com' | Out-Null
+
+        $script:RemovedDriftEntities.Count | Should -Be 2
+        $script:RemovedDriftEntities.StandardName | Should -Contain 'IntuneTemplates.gone-policy-new'
+        $script:RemovedDriftEntities.StandardName | Should -Contain 'IntuneTemplates.gone-policy-accepted'
+    }
+
+    It 'does not prune ConditionalAccessTemplates rows when the CA batch item failed' {
+        Mock -CommandName Test-CIPPStandardLicense -MockWith { param($StandardName, $TenantFilter, $Preset) $Preset -eq 'Entra' }
+        Mock -CommandName New-GraphBulkRequest -MockWith {
+            param($Requests, $tenantid, $asapp)
+            @([pscustomobject]@{ id = 'policies'; status = 429; body = @{ error = @{ message = 'Too many requests' } } })
+        }
+        $script:DriftEntityRows = @(New-DriftEntity -StandardName 'ConditionalAccessTemplates.gone-ca' -Status 'Accepted')
+
+        Get-CIPPDrift -TenantFilter 'contoso.onmicrosoft.com' | Out-Null
+
+        $script:RemovedDriftEntities.Count | Should -Be 0
+    }
+
+    It 'removes a stale ConditionalAccessTemplates row when the CA collection succeeded' {
+        Mock -CommandName Test-CIPPStandardLicense -MockWith { param($StandardName, $TenantFilter, $Preset) $Preset -eq 'Entra' }
+        Mock -CommandName New-GraphBulkRequest -MockWith {
+            param($Requests, $tenantid, $asapp)
+            @([pscustomobject]@{ id = 'policies'; status = 200; body = @{ value = @() } })
+        }
+        $script:DriftEntityRows = @(New-DriftEntity -StandardName 'ConditionalAccessTemplates.gone-ca' -Status 'Accepted')
+
+        Get-CIPPDrift -TenantFilter 'contoso.onmicrosoft.com' | Out-Null
+
+        $script:RemovedDriftEntities.Count | Should -Be 1
+        $script:RemovedDriftEntities[0].StandardName | Should -Be 'ConditionalAccessTemplates.gone-ca'
+    }
+
+    It 'does not prune any rows when the run is scoped to a single template' {
+        # A template-scoped run only sees that template's keys in ValidDriftKeys; pruning would wipe
+        # every other template's rows for the tenant.
+        Mock -CommandName Test-CIPPStandardLicense -MockWith { param($StandardName, $TenantFilter, $Preset) $Preset -eq 'Intune' }
+        $script:DriftEntityRows = @(
+            New-DriftEntity -StandardName 'standards.OtherTemplateStandard' -Status 'New'
+            New-DriftEntity -StandardName 'IntuneTemplates.other-policy' -Status 'New'
+        )
+
+        Get-CIPPDrift -TenantFilter 'contoso.onmicrosoft.com' -TemplateId 'drift-template-1' | Out-Null
+
+        $script:RemovedDriftEntities.Count | Should -Be 0
+    }
+}
+
+Describe 'Get-CIPPDrift - decisions saved under an older default domain' {
+    BeforeEach {
+        $script:IntuneTemplateRows = @()
+        $script:CATemplateRows = @()
+        $script:ReusableTemplateRows = @()
+        $script:AddedDriftEntities = [System.Collections.Generic.List[object]]::new()
+        $script:RemovedDriftEntities = [System.Collections.Generic.List[object]]::new()
+        $script:DriftEntityRows = @(
+            [pscustomobject]@{ PartitionKey = 'contoso.onmicrosoft.com'; RowKey = 'standards_EnableOnlineArchiving'; StandardName = 'standards.EnableOnlineArchiving'; Status = 'DeniedRemediate'; Reason = 'keep archives on'; User = 'tech@contoso.com'; Timestamp = (Get-Date).AddDays(-150) }
+            [pscustomobject]@{ PartitionKey = 'contoso.com'; RowKey = 'standards_EnableOnlineArchiving'; StandardName = 'standards.EnableOnlineArchiving'; Status = 'New'; Timestamp = (Get-Date).AddDays(-90) }
+        )
+        $Tenant = [pscustomobject]@{ customerId = 'cid-1'; defaultDomainName = 'contoso.com'; initialDomainName = 'contoso.onmicrosoft.com' }
+        $script:Lookup = @{ 'cid-1' = $Tenant; 'contoso.com' = $Tenant; 'contoso.onmicrosoft.com' = $Tenant }
+
+        Mock -CommandName Get-CIPPTenantLookup -MockWith { $script:Lookup }
+        Mock -CommandName Test-CIPPStandardLicense -MockWith { $false }
+        Mock -CommandName Get-CippTable -MockWith { param($tablename) @{ TableName = $tablename } }
+        Mock -CommandName New-GraphBulkRequest -MockWith { @() }
+        Mock -CommandName Get-CIPPAzDataTableEntity -MockWith {
+            param($Filter, $TableName)
+            switch -Wildcard ($Filter) {
+                "*PartitionKey eq 'IntuneTemplate'*" { return @($script:IntuneTemplateRows) }
+                "*PartitionKey eq 'CATemplate'*" { return @($script:CATemplateRows) }
+                "*PartitionKey eq 'IntuneReusableSettingTemplate'*" { return @($script:ReusableTemplateRows) }
+                default { return @($script:DriftEntityRows | Where-Object { $Filter -like "*PartitionKey eq '$($_.PartitionKey)'*" }) }
+            }
+        }
+        Mock -CommandName Add-CIPPAzDataTableEntity -MockWith {
+            param($Entity, [switch]$Force, $TableName)
+            foreach ($e in @($Entity)) { $script:AddedDriftEntities.Add($e) }
+        }
+        Mock -CommandName Remove-CIPPAzDataTableEntity -MockWith {
+            param($Entity, $TableName)
+            $script:RemovedDriftEntities.Add($Entity)
+        }
+        Mock -CommandName Get-CIPPTenantAlignment -MockWith {
+            @([pscustomobject]@{
+                    standardType         = 'drift'
+                    StandardName         = 'Standard'
+                    StandardId           = 'sid-7'
+                    AlignmentScore       = 90
+                    CompliantStandards   = 1
+                    LatestDataCollection = (Get-Date)
+                    ComparisonDetails    = @(
+                        [pscustomobject]@{ StandardName = 'standards.EnableOnlineArchiving'; Compliant = $false; StandardValue = $true; ComplianceStatus = 'Non-Compliant' }
+                        [pscustomobject]@{ StandardName = 'standards.DisableSMS'; Compliant = $false; StandardValue = $true; ComplianceStatus = 'Non-Compliant' }
+                    )
+                })
+        }
+    }
+
+    It 'keeps a decision made before the default domain changed instead of raising it as new drift' {
+        $Result = Get-CIPPDrift -TenantFilter 'contoso.com'
+
+        $Archive = @($Result[0].currentDeviations + $Result[0].deniedDeviations) | Where-Object standardName -EQ 'standards.EnableOnlineArchiving' | Select-Object -First 1
+        $Archive.Status | Should -Be 'DeniedRemediate'
+        $Result[0].newDeviationsCount | Should -Be 1
+        $Result[0].deniedDeviationsCount | Should -Be 1
+    }
+
+    It 'moves the decision to the customerId partition and removes the domain-keyed rows' {
+        Get-CIPPDrift -TenantFilter 'contoso.com' | Out-Null
+
+        $Moved = @($script:AddedDriftEntities | Where-Object { $_.StandardName -eq 'standards.EnableOnlineArchiving' })
+        $Moved.Count | Should -Be 1
+        $Moved[0].PartitionKey | Should -Be 'cid-1'
+        $Moved[0].Status | Should -Be 'DeniedRemediate'
+        $Moved[0].Reason | Should -Be 'keep archives on'
+        @($script:RemovedDriftEntities.PartitionKey | Sort-Object) | Should -Be @('contoso.com', 'contoso.onmicrosoft.com')
+    }
+
+    It 'writes a newly detected deviation under the customerId' {
+        Get-CIPPDrift -TenantFilter 'contoso.com' | Out-Null
+
+        $New = @($script:AddedDriftEntities | Where-Object { $_.StandardName -eq 'standards.DisableSMS' })
+        $New.Count | Should -Be 1
+        $New[0].PartitionKey | Should -Be 'cid-1'
+        $New[0].Status | Should -Be 'New'
+    }
+
+    It 'prefers the customerId decision over an older domain-keyed one' {
+        $script:DriftEntityRows = @(
+            [pscustomobject]@{ PartitionKey = 'contoso.onmicrosoft.com'; StandardName = 'standards.EnableOnlineArchiving'; Status = 'DeniedRemediate'; Timestamp = (Get-Date).AddDays(-150) }
+            [pscustomobject]@{ PartitionKey = 'cid-1'; StandardName = 'standards.EnableOnlineArchiving'; Status = 'Accepted'; Timestamp = (Get-Date).AddDays(-200) }
+        )
+        (Get-CIPPTenantDriftState -TenantFilter 'contoso.com').States['standards.EnableOnlineArchiving'].Status | Should -Be 'Accepted'
     }
 }

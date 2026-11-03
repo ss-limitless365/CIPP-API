@@ -19,6 +19,18 @@ function Set-CIPPAssignedPolicy {
         $AssignmentDirection
     )
 
+    # App protection policy lists expose the singular @odata.type as the URLName, but Graph
+    # needs the plural collection segment. Normalize the known types here.
+    $Type = switch ($Type) {
+        'androidManagedAppProtection' { 'androidManagedAppProtections' }
+        'iosManagedAppProtection' { 'iosManagedAppProtections' }
+        'windowsManagedAppProtection' { 'windowsManagedAppProtections' }
+        'mdmWindowsInformationProtectionPolicy' { 'mdmWindowsInformationProtectionPolicies' }
+        'windowsInformationProtectionPolicy' { 'windowsInformationProtectionPolicies' }
+        'targetedManagedAppConfiguration' { 'targetedManagedAppConfigurations' }
+        default { $Type }
+    }
+
     Write-Host "Assigning policy $PolicyId ($PlatformType/$Type) to $GroupName"
 
     try {
@@ -40,40 +52,25 @@ function Set-CIPPAssignedPolicy {
         }
 
         $assignmentsList = [System.Collections.Generic.List[object]]::new()
-        switch ($GroupName) {
-            'allLicensedUsers' {
-                $assignmentsList.Add(
-                    @{
-                        target = @{
-                            '@odata.type' = '#microsoft.graph.allLicensedUsersAssignmentTarget'
-                        }
-                    }
-                )
-            }
-            'AllDevices' {
-                $assignmentsList.Add(
-                    @{
-                        target = @{
-                            '@odata.type' = '#microsoft.graph.allDevicesAssignmentTarget'
-                        }
-                    }
-                )
-            }
-            'AllDevicesAndUsers' {
-                $assignmentsList.Add(
-                    @{
-                        target = @{
-                            '@odata.type' = '#microsoft.graph.allDevicesAssignmentTarget'
-                        }
-                    }
-                )
-                $assignmentsList.Add(
-                    @{
-                        target = @{
-                            '@odata.type' = '#microsoft.graph.allLicensedUsersAssignmentTarget'
-                        }
-                    }
-                )
+        # Explicit ids win over the name. GroupName doubles as the display name of a picked group,
+        # and a group called 'AllDevices' or 'On' must still resolve to that group, not to the token.
+        $AssignmentTarget = if ($GroupIds -and @($GroupIds).Count -gt 0) { 'GroupIds' } else { $GroupName }
+        switch ($AssignmentTarget) {
+            { $_ -in 'allLicensedUsers', 'AllDevices', 'AllDevicesAndUsers' } {
+                # How a broad target is expressed depends on the policy type - the MAM service
+                # behind App Protection takes only group targets. Both this and the assignment
+                # comparison resolve it through the same helper so they cannot disagree.
+                $BroadTarget = Get-CIPPIntuneAssignmentTarget -AssignTo $GroupName -PolicyType $Type
+                if ($BroadTarget.Unsupported) {
+                    Write-LogMessage -headers $Headers -API $APIName -message $BroadTarget.Unsupported -sev 'Error' -tenant $TenantFilter
+                    throw $BroadTarget.Unsupported
+                }
+                foreach ($Dropped in $BroadTarget.Dropped) {
+                    Write-LogMessage -headers $Headers -API $APIName -message "Skipped the '$Dropped' target on policy $PolicyId : '$Type' policies cannot be assigned to it. The rest of the assignment was applied." -sev 'Warning' -tenant $TenantFilter
+                }
+                foreach ($BroadAssignment in $BroadTarget.Targets) {
+                    $assignmentsList.Add(@{ target = $BroadAssignment })
+                }
             }
             'On' {
                 # Do not assign to any group - used to turn on policy without assignments
@@ -126,14 +123,21 @@ function Set-CIPPAssignedPolicy {
             } else {
                 Write-Host "We're supposed to exclude a custom group. The group is $ExcludeGroup"
                 $ExcludeGroupNames = $ExcludeGroup.Split(',').Trim()
-                $ResolvedExcludeIds = New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/groups?$select=id,displayName&$top=999' -tenantid $TenantFilter |
-                    ForEach-Object {
-                        foreach ($SingleName in $ExcludeGroupNames) {
-                            if ($_.displayName -like ($SingleName -replace '\[', '`[' -replace '\]', '`]')) {
-                                $_.id
-                            }
-                        }
-                    }
+                $AllGroups = @(New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/groups?$select=id,displayName&$top=999' -tenantid $TenantFilter)
+                $ResolvedExcludeIds = [System.Collections.Generic.List[string]]::new()
+                $UnresolvedExcludeNames = [System.Collections.Generic.List[string]]::new()
+                foreach ($SingleName in $ExcludeGroupNames) {
+                    $Pattern = $SingleName -replace '\[', '`[' -replace '\]', '`]'
+                    $Matched = @($AllGroups | Where-Object { $_.displayName -like $Pattern })
+                    if ($Matched.Count -eq 0) { $UnresolvedExcludeNames.Add($SingleName) }
+                    foreach ($m in $Matched) { $ResolvedExcludeIds.Add($m.id) }
+                }
+                # An unresolved exclusion must not fall through to a broader assignment.
+                if ($UnresolvedExcludeNames.Count -gt 0) {
+                    $ErrorMessage = "No groups found matching the specified exclude group name(s): $($UnresolvedExcludeNames -join ', '). Policy not assigned."
+                    Write-LogMessage -headers $Headers -API $APIName -message $ErrorMessage -sev 'Warning' -tenant $TenantFilter
+                    throw $ErrorMessage
+                }
             }
 
             foreach ($egid in $ResolvedExcludeIds) {
@@ -162,13 +166,14 @@ function Set-CIPPAssignedPolicy {
 
         # Determine which existing assignments (if any) must be preserved.
         #   append              -> keep all existing (minus ones the new set overrides)
-        #   replace + direction -> keep everything except the direction being edited
+        #   replace + direction -> keep everything except the direction being edited; include
+        #                          covers All Users / All Devices too, so Replace means "only these"
         #                          (Custom Group action only; legacy replace overwrites everything)
         $DirectionScoped = -not [string]::IsNullOrWhiteSpace($AssignmentDirection)
-        $EditedType = switch ($AssignmentDirection) {
-            'exclude' { '#microsoft.graph.exclusionGroupAssignmentTarget' }
-            'include' { '#microsoft.graph.groupAssignmentTarget' }
-            default { $null }
+        $EditedTypes = switch ($AssignmentDirection) {
+            'exclude' { @('#microsoft.graph.exclusionGroupAssignmentTarget') }
+            'include' { @('#microsoft.graph.groupAssignmentTarget', '#microsoft.graph.allLicensedUsersAssignmentTarget', '#microsoft.graph.allDevicesAssignmentTarget') }
+            default { @() }
         }
         $PreserveExisting = ($AssignmentMode -eq 'append') -or ($AssignmentMode -eq 'replace' -and $DirectionScoped)
 
@@ -191,9 +196,9 @@ function Set-CIPPAssignedPolicy {
             foreach ($ExistingAssignment in $ExistingAssignments) {
                 $ExistingType = $ExistingAssignment.target.'@odata.type'
                 $Keep = if ($AssignmentMode -eq 'replace' -and $DirectionScoped) {
-                    # Direction-scoped replace: drop every target of the edited type, keep the rest
-                    # (the other direction plus All Users / All Devices broad targets).
-                    $ExistingType -ne $EditedType
+                    # Direction-scoped replace: drop every target of the edited direction, keep the other.
+                    # Exclude keeps All Users / All Devices, the exclusions narrow them.
+                    $ExistingType -notin $EditedTypes
                 } else {
                     # Append: keep existing unless the new set overrides the same group/target.
                     switch ($ExistingType) {
@@ -217,6 +222,8 @@ function Set-CIPPAssignedPolicy {
             'deviceHealthScripts' { 'deviceHealthScriptAssignments' }
             'deviceManagementScripts' { 'deviceManagementScriptAssignments' }
             'deviceShellScripts' { 'deviceManagementScriptAssignments' }
+            'hardwareConfigurations' { 'hardwareConfigurationAssignments' }
+            'deviceEnrollmentConfigurations' { 'enrollmentConfigurationAssignments' }
             default { 'assignments' }
         }
 
@@ -266,6 +273,10 @@ function Set-CIPPAssignedPolicy {
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
         Write-LogMessage -headers $Headers -API $APIName -message "Failed to assign $GroupName to Policy $PolicyId, using Platform $PlatformType and $Type. The error is:$($ErrorMessage.NormalizedError)" -Sev 'Error' -tenant $TenantFilter -LogData $ErrorMessage
-        return "Failed to assign $GroupName to Policy $PolicyId. Error: $ErrorMessage"
+        # Throw rather than return the message. A returned string is indistinguishable from success
+        # to any caller that only watches for an exception, which is how a policy whose assignment
+        # failed still got recorded as correctly assigned. Both callers already handle a throw:
+        # Invoke-ExecAssignPolicy turns it into a 500, Set-CIPPIntunePolicy rethrows it.
+        throw "Failed to assign $GroupName to Policy $PolicyId. Error: $($ErrorMessage.NormalizedError)"
     }
 }

@@ -82,7 +82,7 @@ function New-CIPPAPIConfig {
                 $APIApp = New-GraphPOSTRequest -uri 'https://graph.microsoft.com/v1.0/applications' -AsApp $true -NoAuthCheck $true -type POST -body $CreateBody
 
                 try {
-                    $PolicyUpdate = Update-AppManagementPolicy -ApplicationId $APIApp.appId
+                    $PolicyUpdate = Update-AppManagementPolicy -ApplicationId $APIApp.appId -PolicyName 'CIPP SSO and API Exemption Policy'
                     Write-Information $PolicyUpdate.PolicyAction
                 } catch {
                     Write-Information "Failed to update app management policy: $($_.Exception.Message)"
@@ -149,7 +149,7 @@ function New-CIPPAPIConfig {
                     Write-Information "Setting Application Identifier URI to '$DesiredIdentifierUri'"
                     $IdentifierUriBody = @{
                         identifierUris = @($DesiredIdentifierUri)
-                    }
+                    } | ConvertTo-Json -Depth 5 -Compress
                     $IdentifierUriUpdated = $false
                     for ($Attempt = 1; $Attempt -le 6; $Attempt++) {
                         try {
@@ -237,7 +237,7 @@ function New-CIPPAPIConfig {
                 $Step = 'Resetting Application Password'
 
                 try {
-                    $PolicyUpdate = Update-AppManagementPolicy -ApplicationId $APIApp.appId
+                    $PolicyUpdate = Update-AppManagementPolicy -ApplicationId $APIApp.appId -PolicyName 'CIPP SSO and API Exemption Policy'
                     Write-Information "Policy check for secret reset: $($PolicyUpdate.PolicyAction)"
                 } catch {
                     Write-Information "Failed to update app management policy during secret reset: $($_.Exception.Message)"
